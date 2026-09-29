@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Pen canvas",
+    "description": "Gives the model a sized drawing canvas with brush tools and screenshots, and shows it in the right sidebar, zoomable and pannable, with a PNG export button."
+  }
+}

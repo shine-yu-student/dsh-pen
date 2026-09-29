@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Pen canvas">
+  <rect x="6" y="10" width="52" height="44" rx="6" fill="#ffffff" stroke="#247bbf" stroke-width="3"/>
+  <path d="M14 42c8-16 14 6 22-8 3-5 8-6 14-10" fill="none" stroke="#e63946" stroke-width="5" stroke-linecap="round"/>
+  <path d="M14 50h20" fill="none" stroke="#8d603c" stroke-width="4" stroke-linecap="round"/>
+  <path d="M46 6l8 8-14 14-8-8z" fill="#ffd60a" stroke="#8d603c" stroke-width="2" stroke-linejoin="round"/>
+</svg>

@@ -1,0 +1,6 @@
+# One row mounts the whole bundle: the Host half registers the pen tools and the
+# `/pen` canvas route, and the client half (declared by `dsh.client` in
+# package.json) registers the canvas panel in the composer input dock.
+- insert:
+    - id: dsh-pen
+      name: '@local/dsh-pen'

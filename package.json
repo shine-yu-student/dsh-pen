@@ -1,0 +1,26 @@
+{
+  "name": "@local/dsh-pen",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Drawing canvas for the model: brush tools, screenshots, and a zoomable canvas panel in the right sidebar.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client/pen-client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "icon": "./icon.svg",
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  }
+}
