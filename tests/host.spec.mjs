@@ -40,6 +40,32 @@ function identify(bytes) {
   }
 }
 
+/** The RGB triplet of one PNG pixel, read through an external decoder. */
+function pixelOf(bytes, x, y) {
+  const path = join(tmpdir(), `pen-pixel-${process.pid}-${Math.random().toString(16).slice(2)}.png`);
+  const { writeFileSync, unlinkSync } = require('node:fs');
+  writeFileSync(path, bytes);
+  try {
+    const text = execFileSync('identify', ['-format', `%[pixel:p{${x},${y}}]`, '--', path], { encoding: 'utf8' }).trim();
+    // ImageMagick reports srgb()/srgba(); only the color channels matter here.
+    return (text.match(/\d+/g) || []).slice(0, 3).join(',');
+  } finally {
+    unlinkSync(path);
+  }
+}
+
+/** Export one session's canvas and read a pixel from the file that was written. */
+async function pixelColor(session, x, y) {
+  const directory = await mkdtemp(join(tmpdir(), 'pen-pixel-'));
+  try {
+    const target = join(directory, 'check.png');
+    await callTool(harness, 'pen_export', { path: target }, session);
+    return pixelOf(await readFile(target), x, y);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
 /** Build a stub Context that satisfies the plugin's optional services. */
 function createHarness(config) {
   const tools = new Map();
@@ -182,7 +208,7 @@ function callRoute(harness, { method, url, body }) {
 // ── Tool registration ───────────────────────────────────────────────────────
 
 const harness = createHarness({ quality: 2 });
-ok(harness.tools.size === pen.PEN_TOOLS.length, 'all five pen tools register',
+ok(harness.tools.size === pen.PEN_TOOLS.length, 'every declared pen tool registers',
   `registered: ${[...harness.tools.keys()].join(', ')}`);
 for (const name of pen.PEN_TOOLS) ok(harness.tools.has(name), `tool ${name} exists`);
 ok(harness.injected.some((entry) => Array.isArray(entry) && entry.includes('webServer')), 'the browser route is registered when webServer exists');
@@ -198,7 +224,8 @@ ok(harness.injected.some((entry) => entry && entry.name === 'dsh-pen:drawing-can
 const SCHEDULING = {
   pen_create: [[{}, false]],
   pen_draw: [[{}, true]],
-  pen_canvas: [[{}, true], [{ action: 'status' }, true], [{ action: 'clear' }, false]],
+  pen_edit: [[{}, false], [{ edits: [{ index: 0, remove: 1 }] }, false]],
+  pen_canvas: [[{}, true], [{ action: 'status' }, true], [{ action: 'list' }, true], [{ action: 'clear' }, false]],
   pen_screenshot: [[{}, true]],
   pen_export: [[{}, true]],
 };
@@ -255,6 +282,80 @@ const unknownArg = await callTool(harness, 'pen_canvas', { nope: 1 }, 'session-a
 ok(unknownArg instanceof Error && /unknown argument/.test(unknownArg.message), 'unknown arguments are refused before the body runs', unknownArg && unknownArg.message);
 const noCanvas = await callTool(harness, 'pen_canvas', {}, 'session-b').then(() => null, (error) => error);
 ok(noCanvas instanceof Error && /no canvas for this session/.test(noCanvas.message), 'a session without a canvas is refused', noCanvas && noCanvas.message);
+
+// ── Stroke editing (pen_canvas list, pen_edit, pen_draw at) ─────────────────
+
+// A canvas of its own, so the route expectations further down still see session-a.
+await callTool(harness, 'pen_create', { width: 64, height: 64, background: '#ffffff', name: 'edit' }, 'session-edit');
+await callTool(harness, 'pen_draw', {
+  operations: [
+    { kind: 'rect', x: 0, y: 0, width: 64, height: 64, fill: '#ff0000' },
+    { kind: 'circle', cx: 32, cy: 32, radius: 20, fill: '#0000ff' },
+  ],
+}, 'session-edit');
+
+const listed = await callTool(harness, 'pen_canvas', { action: 'list' }, 'session-edit');
+ok(/^0: rect 64x64 @\(0,0\) fill #ff0000 stroke #111111 w3$/m.test(listed.text), 'the list numbers the first stroke and names its geometry', listed.text);
+ok(/\n1: circle r20 @\(32,32\) fill #0000ff stroke #111111 w3\n/.test(listed.text), 'the list numbers the second stroke', listed.text);
+ok(/Showing 0-1 of 2\./.test(listed.text), 'the list reports the shown range', listed.text);
+ok(/0 is underneath, the last is on top/.test(listed.text), 'the list states the paint order', listed.text);
+
+const paged = await callTool(harness, 'pen_canvas', { action: 'list', from: 1, limit: 1 }, 'session-edit');
+ok(/^1: circle/m.test(paged.text) && !/^0: /m.test(paged.text), 'list honours from and limit', paged.text);
+
+ok((await pixelColor('session-edit', 32, 32)) === '0,0,255', 'the later stroke starts on top of the earlier one');
+
+const restacked = await callTool(harness, 'pen_edit', { edits: [{ from: 1, to: 0 }] }, 'session-edit');
+ok(/moved 1 -> 0/.test(restacked.text), 'pen_edit reports a restack', restacked.text);
+ok((await pixelColor('session-edit', 32, 32)) === '255,0,0', 'restacking the circle underneath the rect changes the pixel');
+
+await callTool(harness, 'pen_edit', { edits: [{ from: 0, to: 1 }] }, 'session-edit');
+ok((await pixelColor('session-edit', 32, 32)) === '0,0,255', 'restacking it back brings the circle to the top again');
+
+const replaced = await callTool(harness, 'pen_edit', {
+  edits: [{ index: 1, remove: 1, operations: [{ kind: 'circle', cx: 32, cy: 32, radius: 20, fill: '#00ff00' }] }],
+}, 'session-edit');
+ok(/removed 1 at 1, inserted 1 at 1/.test(replaced.text), 'pen_edit reports a replacement', replaced.text);
+ok((await pixelColor('session-edit', 32, 32)) === '0,255,0', 'the replacement stroke paints instead of the removed one');
+
+const inserted = await callTool(harness, 'pen_draw', {
+  at: 1,
+  operations: [{ kind: 'circle', cx: 10, cy: 10, radius: 6, fill: '#ffff00' }],
+}, 'session-edit');
+ok(/Painted 1 operation\(s\) at 1/.test(inserted.text), 'pen_draw reports the insertion index', inserted.text);
+ok((await pixelColor('session-edit', 10, 10)) === '255,255,0', 'a batch inserted at 1 paints above the stroke below it');
+ok((await pixelColor('session-edit', 32, 32)) === '0,255,0', 'the stroke above the inserted batch still paints over it');
+
+const status2 = await callTool(harness, 'pen_canvas', { action: 'status' }, 'session-edit');
+ok(/3 operation\(s\)/.test(status2.text), 'the inserted stroke is counted by status', status2.text);
+
+const removed = await callTool(harness, 'pen_edit', { edits: [{ index: 0, remove: 2 }] }, 'session-edit');
+ok(/removed 2 at 0/.test(removed.text), 'pen_edit reports a range removal', removed.text);
+ok((await pixelColor('session-edit', 0, 0)) === '255,255,255', 'removing the background leaves the canvas background');
+ok((await pixelColor('session-edit', 32, 32)) === '0,255,0', 'an untouched stroke keeps its exact pixels');
+
+const beforeErrors = (await callTool(harness, 'pen_canvas', { action: 'list' }, 'session-edit')).text;
+const badSplice = await callTool(harness, 'pen_edit', { edits: [{ index: 9, remove: 1 }] }, 'session-edit').then(() => null, (error) => error);
+ok(badSplice instanceof Error && /edits\[0\]\.index must be between 0 and 1/.test(badSplice.message), 'an out-of-range index is refused with its edit path', badSplice && badSplice.message);
+const badMove = await callTool(harness, 'pen_edit', { edits: [{ from: 0, to: 5 }] }, 'session-edit').then(() => null, (error) => error);
+ok(badMove instanceof Error && /edits\[0\]\.to must be between 0 and 0/.test(badMove.message), 'an out-of-range move destination is refused', badMove && badMove.message);
+const mixed = await callTool(harness, 'pen_edit', { edits: [{ index: 0, from: 0, to: 1 }] }, 'session-edit').then(() => null, (error) => error);
+ok(mixed instanceof Error && /mixes index\/remove\/operations with from\/to/.test(mixed.message), 'a mixed edit shape is refused', mixed && mixed.message);
+const clearing = await callTool(harness, 'pen_edit', { edits: [{ index: 0, operations: [{ kind: 'clear' }] }] }, 'session-edit').then(() => null, (error) => error);
+ok(clearing instanceof Error && /cannot contain a clear operation/.test(clearing.message), 'pen_edit refuses a clear operation', clearing && clearing.message);
+const idle = await callTool(harness, 'pen_edit', { edits: [{ index: 0 }] }, 'session-edit').then(() => null, (error) => error);
+ok(idle instanceof Error && /changes nothing/.test(idle.message), 'an edit that changes nothing is refused', idle && idle.message);
+const typo = await callTool(harness, 'pen_edit', { edits: [{ index: 0, remove: 1, oprations: [] }] }, 'session-edit').then(() => null, (error) => error);
+ok(typo instanceof Error && /unknown field "oprations"/.test(typo.message), 'a misspelled edit field is refused instead of silently applied', typo && typo.message);
+const badBatch = await callTool(harness, 'pen_edit', { edits: [{ index: 0, remove: 1 }, { index: 9, remove: 1 }] }, 'session-edit').then(() => null, (error) => error);
+ok(badBatch instanceof Error && /edits\[1\]\.index/.test(badBatch.message), 'a later impossible edit fails the whole batch', badBatch && badBatch.message);
+ok((await callTool(harness, 'pen_canvas', { action: 'list' }, 'session-edit')).text === beforeErrors, 'a failed batch leaves the operation list untouched');
+const badAt = await callTool(harness, 'pen_draw', { at: 7, operations: [{ kind: 'line', x1: 0, y1: 0, x2: 1, y2: 1 }] }, 'session-edit').then(() => null, (error) => error);
+ok(badAt instanceof Error && /at must be an integer between 0 and 1/.test(badAt.message), 'pen_draw refuses an insertion index past the end', badAt && badAt.message);
+const emptyEdits = await callTool(harness, 'pen_edit', { edits: [] }, 'session-edit').then(() => null, (error) => error);
+ok(emptyEdits instanceof Error && /non-empty array/.test(emptyEdits.message), 'pen_edit refuses an empty batch', emptyEdits && emptyEdits.message);
+const noCanvasEdit = await callTool(harness, 'pen_edit', { edits: [{ index: 0, remove: 1 }] }, 'session-nowhere').then(() => null, (error) => error);
+ok(noCanvasEdit instanceof Error && /no canvas for this session/.test(noCanvasEdit.message), 'pen_edit needs a canvas of its own', noCanvasEdit && noCanvasEdit.message);
 
 // ── Screenshot ──────────────────────────────────────────────────────────────
 

@@ -2,11 +2,12 @@
  * Host half of the `dsh-pen` bundle: the drawing canvas service behind the
  * model-facing pen tools and the browser route the canvas panel reads.
  *
- * Tools: `pen_create`, `pen_draw`, `pen_canvas`, `pen_screenshot`, and
- * `pen_export`. The canvas itself is a per-session, in-memory operation list
- * (the session log stays the record of *what was asked*), rendered on demand by
- * the shared software rasterizer at `./pen-shared.cjs`, so a screenshot, the
- * panel preview, and an exported file are the same pixels.
+ * Tools: `pen_create`, `pen_draw`, `pen_edit`, `pen_canvas`, `pen_screenshot`,
+ * and `pen_export`. The canvas itself is a per-session, in-memory, ordered
+ * operation list (the session log stays the record of *what was asked*) that
+ * `pen_edit` restructures by index and the shared software rasterizer at
+ * `./pen-shared.cjs` renders on demand, so a screenshot, the panel preview,
+ * and an exported file are the same pixels.
  *
  * Every extension point is optional except `tools`: a profile without a web
  * server or attachment store still gets the drawing tools.
@@ -24,7 +25,7 @@ const require = createRequire(import.meta.url);
 const { raster, ops } = require('./lib/pen-shared.cjs');
 
 /** Model-facing tool names, in registration order. */
-export const PEN_TOOLS = ['pen_create', 'pen_draw', 'pen_canvas', 'pen_screenshot', 'pen_export'];
+export const PEN_TOOLS = ['pen_create', 'pen_draw', 'pen_edit', 'pen_canvas', 'pen_screenshot', 'pen_export'];
 
 /** Required service: without a tool registry this plugin has nothing to contribute. */
 export const inject = ['tools'];
@@ -108,7 +109,7 @@ const COLOR = { type: 'string', description: 'CSS color: #rgb, #rrggbb, #rrggbba
  * One `oneOf` branch per operation kind keeps the mistakes out of the model's
  * reach instead of failing them in the tool body.
  */
-function operationSchema() {
+function operationSchema(description) {
   const shared = {
     brush: {
       type: 'string',
@@ -131,7 +132,7 @@ function operationSchema() {
   const strokeOf = (properties, required) => objectSchema(Object.assign({}, properties, shared), required);
   return {
     type: 'array',
-    description: 'Drawing operations, painted in array order inside one call. Any number may be batched; independent batches can also run in parallel tool calls.',
+    description: description || 'Drawing operations, painted in array order inside one call. Any number may be batched; independent batches can also run in parallel tool calls.',
     items: {
       oneOf: [
         strokeOf({
@@ -277,12 +278,13 @@ function validateArguments(toolName, schema, args) {
 /** The drawing guide appended to the system prompt while this plugin is mounted. */
 const PROMPT_SECTION = `## Drawing canvas
 
-The \`pen_*\` tools paint on a per-session raster canvas and can read it back:
-- \`pen_create\` sizes the canvas (and clears it); \`pen_draw\` applies a batch of operations in one call; \`pen_canvas\` reports status or clears; \`pen_screenshot\` returns a rendered region as an image; \`pen_export\` writes the canvas to a PNG file.
-- Prefer one \`pen_draw\` call with many operations, and independent \`pen_draw\` calls for independent parts of a drawing: they may run in parallel. \`pen_create\` and a clearing \`pen_canvas\` are scheduled exclusively, so a message that creates and paints still creates first.
+The \`pen_*\` tools paint on a per-session raster canvas that keeps its strokes as an ordered list, and they can read it back. Paint order is list order: index 0 is painted first and sits underneath everything; each later stroke covers the earlier ones.
+
+- Read the numbered strokes with \`pen_canvas { action: "list" }\` before changing a drawing.
+- Change a drawing by editing it. \`pen_edit\` removes, replaces, inserts, and restacks strokes by index, and \`pen_draw\` takes \`at\` to paint a new batch underneath the strokes already there. Every stroke an edit does not touch keeps its exact pixels, so never call \`pen_create\` or clear the canvas to fix a detail, and never repaint strokes that are already right.
+- Prefer one \`pen_draw\` call with many operations, and independent \`pen_draw\` calls for independent parts of a drawing: they may run in parallel. \`pen_create\`, \`pen_edit\`, and a clearing \`pen_canvas\` are scheduled exclusively, so a message that creates and paints still creates first.
 - Coordinates are canvas pixels with the origin at the top-left and y growing downward. Strokes are centered on their path, so keep them at least half a stroke width inside the canvas edges.
-- Colors accept \`#rgb\`, \`#rrggbb\`, \`#rrggbbaa\`, \`rgb()\`/\`rgba()\`, and names. Brushes are \`pen\`, \`marker\`, \`highlighter\`, \`dashed\`, and \`dotted\`; \`strokeWidth\`, \`opacity\`, and \`dash\` override the preset.
-- The user sees the canvas live in the right sidebar's "画笔/Canvas" tab (wheel zooms, drag pans; a compact pen button in the composer opens it) and can export it as a PNG there. Call \`pen_screenshot\` when you need to see the result yourself.`;
+- The user sees the canvas live in the right sidebar's "画笔/Canvas" tab (wheel zooms, drag pans; a compact pen button in the composer opens it) and can export it as a PNG there. Call \`pen_screenshot\` when you need to see the result yourself, and again after an edit.`;
 
 /**
  * Register the pen tools, the browser route, and the prompt guidance.
@@ -500,15 +502,32 @@ export function apply(ctx, rawConfig) {
     description: 'Paint a batch of drawing operations on this session\'s canvas in one call. '
       + 'Operations are applied in array order; independent pen_draw calls in the same message may run in parallel. '
       + 'Nothing is painted if any single operation is invalid.',
-    parameters: objectSchema({ operations: operationSchema() }, ['operations']),
-    // One batch appends between two awaits, so sibling calls of a step cannot
+    parameters: objectSchema({
+      operations: operationSchema(),
+      at: {
+        type: 'number',
+        description: 'Insert the batch at this 0-based operation index instead of appending it; 0 paints underneath every stroke already on the canvas.',
+      },
+    }, ['operations']),
+    // One batch splices between two awaits, so sibling calls of a step cannot
     // interleave inside it; a `clear` operation is atomic for the same reason.
     isConcurrencySafe: () => true,
     async execute(args, exec) {
       const canvas = requireCanvas(exec);
       const normalized = ops.normalizeOperations(args.operations);
+      const at = args.at;
+      let insertAt = null;
+      if (at !== undefined) {
+        if (typeof at !== 'number' || !Number.isInteger(at) || at < 0 || at > canvas.operations.length) {
+          throw new Error(`pen_draw: at must be an integer between 0 and ${canvas.operations.length} (the current operation count)`);
+        }
+        if (normalized.some((operation) => operation.kind === 'clear')) {
+          throw new Error('pen_draw: at cannot insert a clear operation; clear the canvas first, or draw without at');
+        }
+        insertAt = at;
+      }
       if (canvas.operations.length + normalized.length > config.maxOperations) {
-        throw new Error(`pen: this canvas already holds ${canvas.operations.length} operations; at most ${config.maxOperations} fit — clear it or start a new canvas`);
+        throw new Error(`pen: this canvas already holds ${canvas.operations.length} operations; at most ${config.maxOperations} fit — remove some with pen_edit, clear it, or start a new canvas`);
       }
       let painted = 0;
       const summaries = [];
@@ -520,14 +539,16 @@ export function apply(ctx, rawConfig) {
           summaries.length = 0;
           continue;
         }
-        canvas.operations.push(operation);
+        const target = insertAt === null ? canvas.operations.length : insertAt + painted;
+        canvas.operations.splice(target, 0, operation);
         painted += 1;
         if (summaries.length < 8) summaries.push(ops.describeOperation(operation));
       }
       markDirty(canvas);
       const tail = summaries.length < painted ? `, … ${painted - summaries.length} more` : '';
+      const where = insertAt === null ? '' : ` at ${insertAt}`;
       return {
-        text: `Painted ${painted} operation(s) on ${describeCanvas(canvas)}: ${summaries.join('; ')}${tail}. `
+        text: `Painted ${painted} operation(s)${where} on ${describeCanvas(canvas)}: ${summaries.join('; ')}${tail}. `
           + 'Call pen_screenshot to see the result.',
       };
     },
@@ -536,16 +557,18 @@ export function apply(ctx, rawConfig) {
   const canvasTool = defineTool({
     name: 'pen_canvas',
     output: TEXT_OUTPUT,
-    description: 'Read this session\'s canvas status, or clear it. '
-      + 'Use the default status action to check size, revision, and operation count; use clear to wipe the canvas without starting a new one.',
+    description: 'Read this session\'s canvas, or clear it. '
+      + 'The default status action reports size, revision, and operation count; list prints the numbered strokes in paint order (index 0 is underneath); clear wipes the canvas without starting a new one.',
     parameters: objectSchema({
       action: {
         type: 'string',
-        enum: ['status', 'clear'],
-        description: 'status (default) reports the canvas; clear erases every operation but keeps the size.',
+        enum: ['status', 'list', 'clear'],
+        description: 'status (default) reports the canvas; list prints the numbered operations in paint order; clear erases every operation but keeps the size.',
       },
+      from: { type: 'number', description: 'list only: first operation index to print (default 0).' },
+      limit: { type: 'number', description: 'list only: maximum operations to print (default 40, at most 200).' },
     }, []),
-    // Reporting shares a group with anything; wiping the canvas does not.
+    // Reporting and listing share a group with anything; wiping the canvas does not.
     isConcurrencySafe: (args) => !(args && args.action === 'clear'),
     async execute(args, exec) {
       const action = args.action === undefined ? 'status' : args.action;
@@ -556,8 +579,143 @@ export function apply(ctx, rawConfig) {
         return { text: `Cleared ${describeCanvas(canvas)}.` };
       }
       const canvas = requireCanvas(exec);
+      if (action === 'list') {
+        const total = canvas.operations.length;
+        const from = args.from === undefined ? 0 : args.from;
+        const limit = args.limit === undefined ? 40 : args.limit;
+        if (typeof from !== 'number' || !Number.isInteger(from) || from < 0) {
+          throw new Error('pen_canvas: from must be a non-negative integer');
+        }
+        if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1) {
+          throw new Error('pen_canvas: limit must be a positive integer');
+        }
+        const shown = canvas.operations.slice(from, from + Math.min(limit, 200));
+        const footer = shown.length === 0
+          ? `No operations at ${from}-${from + Math.min(limit, 200) - 1}; the canvas holds ${total} operation(s).`
+          : `Showing ${from}-${from + shown.length - 1} of ${total}. pen_edit removes, replaces, inserts, and restacks by index; pen_draw with at inserts underneath.`;
+        return {
+          text: `Operations of ${canvas.name} (${canvas.width}x${canvas.height}px) in paint order — 0 is underneath, the last is on top:\n`
+            + shown.map((operation, offset) => `${from + offset}: ${ops.describeOperation(operation)}`).join('\n')
+            + `\n${footer}`,
+        };
+      }
       return {
-        text: `${describeCanvas(canvas)}. ${canvas.operations.length === 0 ? 'The canvas is empty.' : 'The canvas has painted content.'}`,
+        text: `${describeCanvas(canvas)}. ${canvas.operations.length === 0 ? 'The canvas is empty.' : 'The canvas has painted content.'} `
+          + 'Call pen_canvas with action "list" to read the numbered operations.',
+      };
+    },
+  });
+
+  /**
+   * Validate one structural edit before anything is applied, so a batch that
+   * names an impossible position leaves the canvas untouched.
+   * @param {unknown} raw - one entry of the `edits` argument.
+   * @param {number} index - position in the batch, for error messages.
+   * @returns {object} the prepared edit.
+   */
+  const prepareEdit = (raw, index) => {
+    const path = `edits[${index}]`;
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new Error(`pen_edit: ${path} must be an object`);
+    }
+    for (const key of Object.keys(raw)) {
+      if (key !== 'index' && key !== 'remove' && key !== 'operations' && key !== 'from' && key !== 'to') {
+        throw new Error(`pen_edit: ${path} has unknown field "${key}"`);
+      }
+    }
+    const splices = raw.index !== undefined || raw.remove !== undefined || raw.operations !== undefined;
+    const moves = raw.from !== undefined || raw.to !== undefined;
+    if (splices && moves) {
+      throw new Error(`pen_edit: ${path} mixes index/remove/operations with from/to; give one shape per edit`);
+    }
+    if (moves) {
+      if (raw.from === undefined || raw.to === undefined) throw new Error(`pen_edit: ${path} needs both from and to`);
+      return { kind: 'move', from: raw.from, to: raw.to };
+    }
+    if (!splices) throw new Error(`pen_edit: ${path} needs index (with optional remove/operations) or from/to`);
+    let inserted = [];
+    if (raw.operations !== undefined) {
+      try {
+        inserted = ops.normalizeOperations(raw.operations);
+      } catch (error) {
+        throw new Error(`pen_edit: ${path}.operations: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      for (const operation of inserted) {
+        if (operation.kind === 'clear') {
+          throw new Error(`pen_edit: ${path}.operations cannot contain a clear operation; remove the range instead, or clear the canvas with pen_canvas`);
+        }
+      }
+    }
+    if ((raw.remove === undefined || raw.remove === 0) && inserted.length === 0) {
+      throw new Error(`pen_edit: ${path} changes nothing: give remove, operations, or both`);
+    }
+    return { kind: 'splice', index: raw.index, remove: raw.remove, inserted: inserted };
+  };
+
+  const editTool = defineTool({
+    name: 'pen_edit',
+    output: TEXT_OUTPUT,
+    description: 'Edit this session\'s canvas in place by operation index: insert, remove, replace, or restack strokes. '
+      + 'Every stroke the edit does not touch keeps its exact pixels, so a detail is fixed without repainting the picture. '
+      + 'Paint order is list order (index 0 is underneath); read the numbered strokes with pen_canvas action "list" first.',
+    parameters: objectSchema({
+      edits: {
+        type: 'array',
+        description: 'Edits applied in array order; each index refers to the operation list as it stands when that edit runs.',
+        items: {
+          oneOf: [
+            objectSchema({
+              index: { type: 'number', description: '0-based splice position: 0 inserts underneath everything, the current operation count appends on top.' },
+              remove: { type: 'number', description: 'How many operations starting at index to remove (default 0).' },
+              operations: operationSchema('Operations to insert at index; they paint in array order, above the strokes before index and below the ones after it.'),
+            }, ['index']),
+            objectSchema({
+              from: { type: 'number', description: '0-based index of the operation to restack.' },
+              to: { type: 'number', description: '0-based destination after removal: 0 sends it underneath everything, the last index brings it to the top.' },
+            }, ['from', 'to']),
+          ],
+        },
+      },
+    }, ['edits']),
+    // An edit rewrites the shared operation list by index, so it is scheduled
+    // alone: a sibling paint could shift the positions this call addresses.
+    async execute(args, exec) {
+      const canvas = requireCanvas(exec);
+      const raw = args.edits;
+      if (!Array.isArray(raw) || raw.length === 0) throw new Error('pen_edit: edits must be a non-empty array');
+      if (raw.length > 200) throw new Error('pen_edit: at most 200 edits fit in one call');
+      const prepared = raw.map(prepareEdit);
+      let list = canvas.operations.slice();
+      const summaries = [];
+      try {
+        for (let index = 0; index < prepared.length; index += 1) {
+          const edit = prepared[index];
+          const path = `edits[${index}]`;
+          if (edit.kind === 'move') {
+            list = ops.moveOperation(list, edit.from, edit.to, path);
+            summaries.push(`moved ${edit.from} -> ${edit.to}`);
+            continue;
+          }
+          list = ops.spliceOperations(list, edit.index, edit.remove, edit.inserted, path);
+          const parts = [];
+          if (edit.remove > 0) parts.push(`removed ${edit.remove} at ${edit.index}`);
+          if (edit.inserted.length > 0) {
+            const names = edit.inserted.slice(0, 3).map(ops.describeOperation).join('; ');
+            const more = edit.inserted.length > 3 ? '; …' : '';
+            parts.push(`inserted ${edit.inserted.length} at ${edit.index} (${names}${more})`);
+          }
+          summaries.push(parts.join(', '));
+        }
+      } catch (error) {
+        throw new Error(`pen_edit: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (list.length > config.maxOperations) {
+        throw new Error(`pen: the edit would leave ${list.length} operations; at most ${config.maxOperations} fit on one canvas`);
+      }
+      canvas.operations = list;
+      markDirty(canvas);
+      return {
+        text: `Edited ${describeCanvas(canvas)}: ${summaries.join('; ')}. Call pen_screenshot to check the result.`,
       };
     },
   });
@@ -691,7 +849,7 @@ export function apply(ctx, rawConfig) {
   // ── Registration ─────────────────────────────────────────────────────────
 
   ctx.effect(() => {
-    const disposers = [createTool, drawTool, canvasTool, screenshotTool, exportTool]
+    const disposers = [createTool, drawTool, editTool, canvasTool, screenshotTool, exportTool]
       .map((tool) => ctx.tools.register(tool));
     return () => { for (const dispose of disposers) dispose(); };
   }, 'dsh-pen: drawing tools');
